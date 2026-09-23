@@ -1,0 +1,114 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: kairos_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - wal_level=logical
+      - -c
+      - max_connections=200
+    ports: ["5433:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: kairos_redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6380:6379"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: kairos_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: kairosadmin
+      MINIO_ROOT_PASSWORD: kairosadmin123
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [miniodata:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    container_name: kairos_api
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_started }
+    environment:
+      DATABASE_URL: postgres://kairos:kairos@postgres:5432/kairos_platform
+      PROVISIONER_URL: postgres://postgres:postgres@postgres:5432/postgres
+      PROJECT_DB_HOST: postgres
+      PROJECT_DB_PORT: "5432"
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: kairosadmin
+      S3_SECRET_KEY: kairosadmin123
+      S3_FORCE_PATH_STYLE: "true"
+      JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret_change_me_0000000000000000}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-dev_refresh_secret_change_me_00000000}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      FRONTEND_URL: http://localhost:3000
+      API_URL: http://localhost:4000
+      PORT: "4000"
+    ports: ["4000:4000"]
+    command: ["sh", "-c", "node dist/db/migrate.js && node dist/index.js"]
+
+  worker:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    container_name: kairos_worker
+    depends_on:
+      api: { condition: service_started }
+    environment:
+      DATABASE_URL: postgres://kairos:kairos@postgres:5432/kairos_platform
+      PROVISIONER_URL: postgres://postgres:postgres@postgres:5432/postgres
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: kairosadmin
+      S3_SECRET_KEY: kairosadmin123
+      JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret_change_me_0000000000000000}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-dev_refresh_secret_change_me_00000000}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+    command: ["node", "dist/workers/index.js"]
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: apps/dashboard/Dockerfile
+    container_name: kairos_dashboard
+    depends_on: [api]
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+    ports: ["3000:3000"]
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

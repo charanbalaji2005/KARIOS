@@ -1,0 +1,107 @@
+#!/usr/sbin/nft -f
+###############################################################################
+# KAIROS baseline firewall
+#
+# Installed by scripts/install-server.sh to /etc/kairos/nftables.conf, and
+# regenerated from there by the server agent whenever the operator changes the
+# firewall from the dashboard.
+#
+# Load it with:   nft -f /etc/kairos/nftables.conf
+# Check it first: nft -c -f /etc/kairos/nftables.conf
+#
+# Everything lives in a table named `kairos`, and only that table is replaced.
+# Docker writes its own chains into its own tables; flushing the whole ruleset
+# would remove them and break every container's networking.
+#
+# The security property this file provides is a negative one: PostgreSQL, Redis
+# and the storage ports appear nowhere below. They are not blocked by a deny
+# rule that could be reordered or removed — they are simply never accepted, so
+# the default drop covers them.
+###############################################################################
+
+table inet kairos
+delete table inet kairos
+
+table inet kairos {
+
+    # Addresses allowed to reach SSH. Empty by default: SSH is not open from
+    # the network at all until someone says otherwise. Change it from the
+    # dashboard (Firewall → SSH) rather than by editing this file, or the next
+    # dashboard change will overwrite your edit.
+    set ssh_allowed {
+        type ipv4_addr
+        flags interval
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        # Loopback. This is how the API reaches PostgreSQL and Redis, and how
+        # the dashboard reaches the API when nothing is proxying.
+        iif lo accept
+
+        # Replies to connections this machine opened.
+        ct state established,related accept
+        ct state invalid drop
+
+        # ICMP. Dropping it does not make a host safer, it makes path MTU
+        # discovery fail silently and intermittently — which presents as
+        # "large responses hang" and takes a day to diagnose.
+        ip protocol icmp icmp type {
+            echo-request,
+            destination-unreachable,
+            time-exceeded,
+            parameter-problem
+        } accept
+        ip6 nexthdr icmpv6 accept
+
+        # --- The only ports open to the network -------------------------
+        #
+        # HTTPS carries the dashboard, the REST API, the storage API and the
+        # realtime WebSocket. One port, because one port is one thing to get
+        # right.
+        tcp dport 443 accept
+
+        # HTTP, for the redirect to HTTPS and for ACME challenges. Close it if
+        # you use a Cloudflare Tunnel and never issue a certificate locally.
+        tcp dport 80 accept
+
+        # SSH, only from the addresses in the set above. An empty set matches
+        # nothing, so this rule accepts nothing until one is added.
+        ip saddr @ssh_allowed tcp dport 22 accept
+
+        # --- Deliberately absent ----------------------------------------
+        #
+        #   5432  PostgreSQL       clients go through the API, never this
+        #   6379  Redis            unauthenticated by default; remote code
+        #                          execution is the normal outcome of exposing it
+        #   9000  Object storage   the API proxies it
+        #   9001  Storage console  an admin UI with no business being reachable
+        #   4000  KAIROS API       should sit behind nginx for TLS and limits
+        #   3000  Dashboard        same
+        #
+        # These are not listed, so the policy above drops them. Adding one here
+        # is the single change that would undo the main guarantee this product
+        # makes, so do not — bind the service to 127.0.0.1 instead and let the
+        # API reach it over loopback.
+
+        # Log what is dropped, at a rate that cannot fill the disk during a
+        # scan. fail2ban does not read this; it is for a human asking "is
+        # something knocking?".
+        limit rate 10/minute burst 20 packets log prefix "kairos-drop: " level info
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        # Docker installs its own forward rules in its own table and they are
+        # evaluated independently. This chain covers everything else.
+        ct state established,related accept
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+        # Outbound is unrestricted: the API makes webhook calls, fetches ACME
+        # certificates, and the tunnel dials out. Locking this down breaks all
+        # three and buys very little on a single-purpose machine.
+    }
+}

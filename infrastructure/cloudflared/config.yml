@@ -1,0 +1,73 @@
+###############################################################################
+# KAIROS DB — Cloudflare Tunnel ingress
+#
+# Why a tunnel: cloudflared dials OUT to Cloudflare and keeps the connection
+# open. Traffic arrives down that connection, so the laptop needs zero inbound
+# ports. That solves three problems at once — CGNAT, a dynamic home IP, and
+# publishing your home address in DNS.
+#
+# Setup:
+#   cloudflared tunnel login
+#   cloudflared tunnel create kairos
+#   cloudflared tunnel route dns kairos cloud.example.com
+#   cloudflared tunnel route dns kairos api.example.com
+#   cloudflared tunnel route dns kairos realtime.example.com
+#   cloudflared tunnel route dns kairos files.example.com
+#   cloudflared tunnel --config infrastructure/cloudflared/config.yml run
+#
+# Or run it in Docker with a token:
+#   TUNNEL_TOKEN=... docker compose -f docker-compose.prod.yml --profile tunnel up -d
+#
+# With the tunnel in place, delete nginx's `ports:` block and set the firewall
+# to deny all inbound. Nothing needs to be open.
+###############################################################################
+
+tunnel: kairos
+credentials-file: /etc/cloudflared/kairos.json
+
+# Reduce the connection count on a laptop with a modest uplink.
+protocol: quic
+retries: 5
+grace-period: 30s
+
+# cloudflared writes its own metrics endpoint; scraped by Prometheus.
+metrics: 0.0.0.0:2000
+loglevel: info
+
+originRequest:
+  connectTimeout: 10s
+  noTLSVerify: true        # nginx origin cert is self-signed behind the tunnel
+  keepAliveConnections: 32
+  keepAliveTimeout: 90s
+  httpHostHeader: ""
+
+ingress:
+  # Dashboard
+  - hostname: cloud.example.com
+    service: http://nginx:80
+    originRequest:
+      httpHostHeader: cloud.example.com
+
+  # API
+  - hostname: api.example.com
+    service: http://nginx:80
+    originRequest:
+      httpHostHeader: api.example.com
+
+  # Realtime — long-lived WebSockets. Do not shorten these timeouts.
+  - hostname: realtime.example.com
+    service: http://nginx:80
+    originRequest:
+      httpHostHeader: realtime.example.com
+      connectTimeout: 30s
+      tcpKeepAlive: 30s
+
+  # Storage — large uploads need a generous timeout.
+  - hostname: files.example.com
+    service: http://nginx:80
+    originRequest:
+      httpHostHeader: files.example.com
+      connectTimeout: 30s
+
+  # Everything else is refused at the edge.
+  - service: http_status:404

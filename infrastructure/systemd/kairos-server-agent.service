@@ -1,0 +1,98 @@
+###############################################################################
+# KAIROS Server Agent
+#
+# The privileged half of the admin panel. Runs as root because it manages
+# systemd units, nftables and packages — and is fenced in by everything below
+# rather than by trusting that it never needs to be.
+#
+# Installed by scripts/install-server.sh to
+# /etc/systemd/system/kairos-server-agent.service
+###############################################################################
+
+[Unit]
+Description=KAIROS Server Agent
+Documentation=https://github.com/kairosdb/kairosdb
+# The agent reports on Docker and manages containers, so start after it when it
+# exists. `Wants` rather than `Requires`: an installation that runs PostgreSQL
+# on the host directly has no Docker, and the agent must still start there.
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/kairos/services/server-agent/dist/index.js
+
+# Runs as root: `systemctl restart postgresql` and `nft -f` are not things an
+# unprivileged user can do, and the whole point of the agent is that it is the
+# one component that can.
+User=root
+Group=root
+
+# The socket lives here. RuntimeDirectory makes systemd create it on start and
+# remove it on stop, so a crashed agent never leaves a stale socket behind.
+RuntimeDirectory=kairos
+RuntimeDirectoryMode=0750
+ConfigurationDirectory=kairos
+ConfigurationDirectoryMode=0750
+
+Environment=NODE_ENV=production
+Environment=KAIROS_AGENT_SOCKET=/run/kairos/server-agent.sock
+Environment=KAIROS_DATA_ROOT=/var/lib/kairos
+Environment=KAIROS_CONFIG_ROOT=/etc/kairos
+Environment=KAIROS_AGENT_GROUP=kairos
+# Credentials come from a file root owns, not from this unit — a unit file is
+# world-readable and `systemctl show` prints Environment= to anyone.
+EnvironmentFile=-/etc/kairos/agent.env
+
+# Always. If the agent dies, the operator loses their only remote tooling at
+# exactly the moment they need it.
+Restart=always
+RestartSec=3
+# Do not give up after the default 5 attempts: a machine that is thrashing
+# during boot should still end up with a running agent.
+StartLimitIntervalSec=0
+
+# --- Hardening --------------------------------------------------------------
+#
+# Root is necessary; unrestricted root is not. These narrow what "root" means
+# for this process without taking away the capabilities it actually uses.
+
+NoNewPrivileges=no
+# ^ `no` deliberately: systemctl and apt-get need to gain privileges for the
+#   units they start. Setting this to yes silently breaks service control.
+
+ProtectHome=yes
+ProtectKernelTunables=no
+# ^ also deliberate: nftables writes to /proc/sys/net when loading a ruleset.
+
+PrivateTmp=yes
+RemoveIPC=no
+
+# Paths the agent legitimately writes to. Everything else on the filesystem is
+# read-only to it, which is what makes "the agent has no operation that deletes
+# your home directory" a property of the OS and not only of the code.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kairos /etc/kairos /run/kairos /var/log/kairos /var/run/docker.sock
+
+# The agent talks over a unix socket and, for its optional fallback, loopback.
+# It has no reason to reach the network itself.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# ^ AF_NETLINK is required by nft and ip; AF_INET for the loopback fallback and
+#   for pg_isready.
+
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=no
+# ^ `no`: apt-get installs setuid binaries.
+
+# Journald captures stdout; the agent logs one JSON object per line.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kairos-agent
+
+# A runaway `du` over a full disk should not take the machine with it.
+MemoryMax=512M
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

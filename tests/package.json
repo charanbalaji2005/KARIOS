@@ -1,0 +1,23 @@
+{
+  "name": "@kairosdb/tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "tsx benchmark/latency.bench.ts",
+    "e2e": "playwright test -c e2e/playwright.config.ts",
+    "test:security": "vitest run integration/ssrf.test.ts integration/quotas.test.ts integration/sql-guard.test.ts integration/totp.test.ts integration/server-agent.test.ts integration/server-registry.test.ts integration/schema-catalog-contract.test.ts",
+    "bench:load": "tsx benchmark/load.bench.ts",
+    "test:server": "vitest run integration/server-agent.test.ts integration/server-registry.test.ts"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.2",
+    "typescript": "^5.6.2",
+    "tsx": "^4.19.1",
+    "@playwright/test": "^1.48.0",
+    "ws": "^8.18.0",
+    "@types/ws": "^8.5.12"
+  }
+}

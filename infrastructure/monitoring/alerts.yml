@@ -1,0 +1,82 @@
+### KAIROS DB — alert rules
+###
+### Tuned for a single laptop, not a fleet. The failure modes that actually
+### take this platform down are: the SSD fills, the CPU cooks, the power goes
+### out, or the backup job has been quietly failing for three weeks.
+
+groups:
+  - name: kairos-capacity
+    rules:
+      - alert: DiskFillingUp
+        expr: (kairos_disk_used_bytes / kairos_disk_total_bytes) > 0.85
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Data volume above 85%"
+          description: "Postgres refuses writes when the volume fills. Prune backups or add storage."
+
+      - alert: DiskCritical
+        expr: (kairos_disk_used_bytes / kairos_disk_total_bytes) > 0.95
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Data volume above 95% — writes will fail shortly"
+
+      - alert: MemoryPressure
+        expr: (kairos_memory_used_bytes / kairos_memory_total_bytes) > 0.92
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Host memory above 92%"
+          description: "The OOM killer picks a victim next, and it is usually Postgres."
+
+  - name: kairos-thermal
+    rules:
+      - alert: CpuThrottling
+        expr: kairos_cpu_temperature_celsius > 85
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "CPU above 85°C"
+          description: "A laptop under a sustained load throttles. Check airflow before blaming query plans."
+
+      - alert: CpuCritical
+        expr: kairos_cpu_temperature_celsius > 95
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "CPU above 95°C — thermal shutdown is close"
+
+  - name: kairos-availability
+    rules:
+      - alert: ApiDown
+        expr: up{job="kairos-api"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "API is not being scraped"
+
+      - alert: PostgresDown
+        expr: up{job="postgres"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "PostgreSQL exporter is down"
+
+      - alert: ApiRestarting
+        expr: kairos_process_uptime_seconds < 300
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "API keeps restarting"
+          description: "Uptime has stayed under five minutes for a quarter of an hour — a crash loop."
+
+  - name: kairos-backups
+    rules:
+      - alert: BackupStale
+        # Emitted by scripts/backup-rotate.sh via the Pushgateway.
+        expr: time() - kairos_backup_last_success_timestamp > 172800
+        labels: { severity: critical }
+        annotations:
+          summary: "No successful backup in 48 hours"
+          description: "The laptop is the only copy right now. Fix this before anything else."

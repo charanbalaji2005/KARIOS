@@ -1,0 +1,45 @@
+### KAIROS DB — Prometheus scrape configuration
+###
+### Runs on the internal network. Do not publish port 9090: the metrics
+### describe exactly when the server is loaded and how full the disk is,
+### which is reconnaissance you are handing out for free.
+
+global:
+  scrape_interval:     30s
+  evaluation_interval: 30s
+  external_labels:
+    node: kairos-laptop
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: kairos-api
+    metrics_path: /api/v1/server/prometheus
+    static_configs:
+      - targets: ['api:4000']
+    # The endpoint requires an authenticated platform user. Mint a long-lived
+    # token for a dedicated monitoring account rather than reusing your own.
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/kairos-token
+
+  - job_name: node
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  - job_name: postgres
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  - job_name: redis
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  - job_name: nginx
+    static_configs:
+      - targets: ['nginx-exporter:9113']
+
+  - job_name: cloudflared
+    static_configs:
+      - targets: ['cloudflared:2000']

@@ -1,0 +1,148 @@
+###############################################################################
+# KAIROS DB — fail2ban jails
+#
+#   sudo cp jail.local           /etc/fail2ban/jail.local
+#   sudo cp filter.d/kairos-*    /etc/fail2ban/filter.d/
+#   sudo systemctl restart fail2ban
+#   sudo fail2ban-client status
+#
+# Test a filter before trusting it:
+#   fail2ban-regex /var/log/kairos/security.log \
+#                  /etc/fail2ban/filter.d/kairos-auth.conf
+#
+# A filter that matches nothing produces a jail that bans nobody, and the
+# status output looks identical either way. Always check the match count.
+###############################################################################
+
+[DEFAULT]
+
+# Never ban yourself. Add your LAN, your VPN, and the Docker bridge — the
+# API talks to nginx over the bridge and banning it would take the site down.
+ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+
+# Escalating bans: a repeat offender gets exponentially longer sentences,
+# capped at a week. A fat-fingered password stays a ten-minute inconvenience.
+bantime.increment  = true
+bantime.factor     = 2
+bantime.maxtime    = 1w
+bantime.rndtime    = 5m
+
+backend   = auto
+usedns    = no
+logencoding = utf-8
+
+# nftables is the modern default. If you chose UFW, use:
+#   banaction = ufw
+banaction     = nftables-multiport
+banaction_allports = nftables-allports
+
+# Uncomment to also push bans to Cloudflare, so blocked traffic never reaches
+# the laptop at all. Requires CF_USER and CF_TOKEN in action.d/cloudflare.conf.
+# action = %(action_)s
+#          cloudflare[cfuser="%(cfemail)s", cftoken="%(cfapikey)s"]
+
+destemail = root@localhost
+sender    = fail2ban@kairosdb.local
+action    = %(action_)s
+
+
+###############################################################################
+# Application jails — read the Kairos security event log
+###############################################################################
+
+[kairos-auth]
+enabled  = true
+filter   = kairos-auth
+logpath  = /var/log/kairos/security.log
+port     = http,https
+maxretry = 6
+findtime = 10m
+bantime  = 1h
+
+[kairos-apikey]
+# Someone walking through API keys. Legitimate clients get this wrong once
+# during setup, not twenty times in five minutes.
+enabled  = true
+filter   = kairos-apikey
+logpath  = /var/log/kairos/security.log
+port     = http,https
+maxretry = 20
+findtime = 5m
+bantime  = 6h
+
+[kairos-abuse]
+# Path traversal, rejected SQL identifiers, token replay. These are not
+# mistakes a normal client makes. One is noise; three is an attacker.
+enabled  = true
+filter   = kairos-abuse
+logpath  = /var/log/kairos/security.log
+port     = http,https
+maxretry = 3
+findtime = 30m
+bantime  = 24h
+
+
+###############################################################################
+# Nginx jails — read the gateway access log
+###############################################################################
+
+[kairos-nginx-limit]
+# Tripping nginx's own rate limiter repeatedly. nginx already returned 429;
+# fail2ban stops the traffic reaching nginx at all.
+enabled  = true
+filter   = kairos-nginx-limit
+logpath  = /var/log/nginx/error.log
+port     = http,https
+maxretry = 10
+findtime = 5m
+bantime  = 2h
+
+[kairos-nginx-scan]
+# Probing for /wp-admin, /.env, /phpmyadmin and friends. Nothing here is
+# written in PHP, so every one of these is hostile by definition.
+enabled  = true
+filter   = kairos-nginx-scan
+logpath  = /var/log/nginx/access.log
+port     = http,https
+maxretry = 3
+findtime = 10m
+bantime  = 1w
+
+[kairos-nginx-badbots]
+enabled  = true
+filter   = kairos-nginx-scan
+logpath  = /var/log/nginx/access.log
+port     = http,https
+maxretry = 2
+findtime = 1d
+bantime  = 1w
+
+
+###############################################################################
+# Host jails
+###############################################################################
+
+[sshd]
+# Only meaningful if you actually expose SSH. Harmless if you do not.
+enabled   = true
+port      = ssh
+filter    = sshd
+logpath   = %(sshd_log)s
+backend   = %(sshd_backend)s
+maxretry  = 3
+findtime  = 10m
+bantime   = 1d
+
+[recidive]
+# The catch-all: banned by any jail five times in a week earns a month.
+enabled  = true
+filter   = recidive
+logpath  = /var/log/fail2ban.log
+banaction = %(banaction_allports)s
+maxretry = 5
+findtime = 1w
+bantime  = 30d

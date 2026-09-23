@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background-color: #10131A;
+  color: #DCE1EA;
+  font-feature-settings: 'tnum' 1, 'cv05' 1;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Focus is always visible — this is a keyboard-heavy tool. */
+:focus-visible {
+  outline: 2px solid #7C6BF2;
+  outline-offset: 2px;
+}
+
+::selection { background: rgba(124, 107, 242, 0.35); }
+
+/* Dense table scrollers keep their own scrollbars rather than the page's. */
+.scroller { overflow: auto; scrollbar-width: thin; scrollbar-color: #2A303C transparent; }
+.scroller::-webkit-scrollbar { height: 10px; width: 10px; }
+.scroller::-webkit-scrollbar-thumb { background: #2A303C; border-radius: 6px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}

@@ -1,0 +1,338 @@
+###############################################################################
+# KAIROS DB — production compose
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# The single most important difference from docker-compose.yml:
+#
+#   PostgreSQL, Redis and MinIO have NO `ports:` mapping.
+#
+# Without a mapping they exist only on `kairos_internal`, which is declared
+# `internal: true` — that network has no route to the host or the internet.
+# Nothing you misconfigure in nginx can expose the database, because there is
+# no path from the outside to port 5432 at all.
+#
+#   internet ──▶ cloudflared / host:443 ──▶ nginx ──▶ api ──▶ postgres
+#                     kairos_public          kairos_internal
+###############################################################################
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-api-env: &api-env
+  NODE_ENV: production
+  DATABASE_URL: postgres://kairos:${POSTGRES_APP_PASSWORD:?set POSTGRES_APP_PASSWORD}@postgres:5432/kairos_platform
+  PROVISIONER_URL: postgres://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/postgres
+  PROJECT_DB_HOST: ${PROJECT_DB_HOST:-postgres}
+  PROJECT_DB_PORT: "5432"
+  REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY}
+  S3_FORCE_PATH_STYLE: "true"
+  JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+  JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set JWT_REFRESH_SECRET}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?set ENCRYPTION_KEY}
+  API_URL: ${API_URL:?set API_URL}
+  FRONTEND_URL: ${FRONTEND_URL:?set FRONTEND_URL}
+  SECURITY_LOG_PATH: /var/log/kairos/security.log
+  # nginx only = 1. Cloudflare in front of nginx = 2. See env.ts.
+  TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+services:
+
+  ## ===================================================================
+  ## EDGE — the only containers touching kairos_public
+  ## ===================================================================
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: kairos_nginx
+    restart: unless-stopped
+    depends_on:
+      api: { condition: service_healthy }
+      dashboard: { condition: service_started }
+    # If you use a Cloudflare Tunnel, delete this block entirely. The tunnel
+    # dials out to Cloudflare, so the laptop needs no inbound ports at all.
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infrastructure/nginx/snippets:/etc/nginx/snippets:ro
+      - ./infrastructure/nginx/sites:/etc/nginx/sites:ro
+      - ./infrastructure/nginx/certs:/etc/nginx/certs:ro
+      - certbot_webroot:/var/www/certbot
+      - nginx_logs:/var/log/nginx
+    networks: [kairos_public, kairos_edge]
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  cloudflared:
+    # Optional. Gives you a public hostname without opening a single inbound
+    # port, which matters if your ISP uses CGNAT or you'd rather not advertise
+    # your home IP. Set TUNNEL_TOKEN and remove nginx's `ports:` block.
+    image: cloudflare/cloudflared:latest
+    container_name: kairos_cloudflared
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN or disable the tunnel profile}
+    depends_on: [nginx]
+    networks: [kairos_public]
+    logging: *default-logging
+
+  fail2ban:
+    # Needs the host network namespace and NET_ADMIN to write firewall rules
+    # that actually affect the host. A jail inside a bridge network can only
+    # ban traffic that has already arrived, which is not a ban.
+    image: lscr.io/linuxserver/fail2ban:latest
+    container_name: kairos_fail2ban
+    restart: unless-stopped
+    profiles: ["security"]
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW]
+    environment:
+      TZ: ${TZ:-UTC}
+      VERBOSITY: "-vv"
+    volumes:
+      - ./infrastructure/fail2ban/jail.local:/config/fail2ban/jail.local:ro
+      - ./infrastructure/fail2ban/filter.d:/config/fail2ban/filter.d:ro
+      - fail2ban_db:/config/fail2ban/db
+      - nginx_logs:/var/log/nginx:ro
+      - kairos_logs:/var/log/kairos:ro
+    logging: *default-logging
+
+  ## ===================================================================
+  ## APPLICATION — bridges the edge and the internal network
+  ## ===================================================================
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    container_name: kairos_api
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    environment: *api-env
+    # No `ports:`. Only nginx, on kairos_edge, can reach this.
+    volumes:
+      - kairos_logs:/var/log/kairos
+    networks: [kairos_edge, kairos_internal]
+    logging: *default-logging
+    command: ["sh", "-c", "node dist/db/migrate.js && node dist/index.js"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 1536M }
+
+  worker:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    container_name: kairos_worker
+    restart: unless-stopped
+    depends_on:
+      api: { condition: service_healthy }
+    environment: *api-env
+    volumes:
+      - kairos_logs:/var/log/kairos
+      - backups:/var/lib/kairos/backups
+    networks: [kairos_internal]
+    logging: *default-logging
+    command: ["node", "dist/workers/index.js"]
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 1024M }
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: apps/dashboard/Dockerfile
+    container_name: kairos_dashboard
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?set NEXT_PUBLIC_API_URL}
+    networks: [kairos_edge]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 768M }
+
+  ## ===================================================================
+  ## DATA PLANE — kairos_internal only, no host ports, no internet
+  ## ===================================================================
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: kairos_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+      KAIROS_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?set POSTGRES_APP_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - wal_level=logical
+      - -c
+      - max_connections=300
+      - -c
+      - listen_addresses=*          # * here means the internal network only
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+      - -c
+      - log_min_duration_statement=1000
+      - -c
+      - ssl=off                     # traffic never leaves the internal bridge
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    networks: [kairos_internal]
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits: { cpus: "4.0", memory: 4096M }
+
+  redis:
+    image: redis:7-alpine
+    container_name: kairos_redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes: [redisdata:/data]
+    networks: [kairos_internal]
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 768M }
+
+  minio:
+    image: minio/minio:latest
+    container_name: kairos_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set S3_SECRET_KEY}
+      MINIO_BROWSER: ${MINIO_BROWSER:-off}   # the console is not a public app
+    volumes:
+      - miniodata:/data
+    networks: [kairos_internal]
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2048M }
+
+  ## ===================================================================
+  ## OPERATIONS
+  ## ===================================================================
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: kairos_certbot
+    profiles: ["tls"]
+    volumes:
+      - certbot_webroot:/var/www/certbot
+      - ./infrastructure/nginx/certs:/etc/letsencrypt
+    networks: [kairos_public]
+    entrypoint: >
+      sh -c "trap exit TERM;
+             while :; do certbot renew --webroot -w /var/www/certbot --quiet;
+             sleep 12h & wait $${!}; done"
+
+  backup-sidecar:
+    # Copies finished backups off the laptop. The laptop IS the cloud, so a
+    # backup that only exists on the laptop is not a backup — one dead SSD
+    # takes the data and every copy of it at the same time.
+    image: rclone/rclone:latest
+    container_name: kairos_backup_sidecar
+    profiles: ["offsite"]
+    restart: unless-stopped
+    environment:
+      RCLONE_CONFIG_REMOTE_TYPE: ${OFFSITE_TYPE:-s3}
+    volumes:
+      - backups:/data/backups:ro
+      - ./infrastructure/backup/rclone.conf:/config/rclone/rclone.conf:ro
+    networks: [kairos_public]
+    entrypoint: >
+      sh -c "while :; do
+               rclone sync /data/backups remote:${OFFSITE_BUCKET:-kairos-backups} --stats-one-line;
+               sleep 21600;
+             done"
+
+networks:
+  # Faces the internet. Only nginx, cloudflared and certbot live here.
+  kairos_public:
+    name: kairos_public
+    driver: bridge
+
+  # nginx ↔ api ↔ dashboard. Not internal, because nginx needs egress for
+  # OCSP stapling and DNS resolution.
+  kairos_edge:
+    name: kairos_edge
+    driver: bridge
+
+  # Postgres, Redis, MinIO. `internal: true` removes the default gateway:
+  # these containers cannot reach the internet and the internet cannot reach
+  # them, even if a port mapping is added by mistake.
+  kairos_internal:
+    name: kairos_internal
+    driver: bridge
+    internal: true
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  backups:
+  nginx_logs:
+  kairos_logs:
+  fail2ban_db:
+  certbot_webroot:

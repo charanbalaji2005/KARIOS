@@ -1,0 +1,61 @@
+### KAIROS DB — local / LAN vhost
+###
+### Use this instead of kairos.conf when you have no domain and no
+### certificates yet — stage 1 and stage 2 of the rollout. Path-based
+### routing on a single host, plain HTTP, no TLS.
+###
+###   http://kairos.local/            → dashboard
+###   http://kairos.local/api/        → API
+###   http://kairos.local/rest/v1/    → auto REST
+###   http://kairos.local/realtime/v1 → WebSocket
+###   http://kairos.local/storage/v1/ → storage
+###
+### Rename to `default.conf` and delete `kairos.conf` to activate.
+
+server {
+    listen      80;
+    listen      [::]:80;
+    server_name kairos.local localhost _;
+
+    include /etc/nginx/snippets/security-headers.conf;
+    # No HSTS over plain HTTP — it would make the site unreachable later.
+    add_header Strict-Transport-Security "" always;
+
+    client_max_body_size 1g;
+
+    location /api/ {
+        limit_req zone=kairos_api burst=40 nodelay;
+        proxy_pass http://kairos_api_backend;
+        include /etc/nginx/snippets/proxy-params.conf;
+        proxy_read_timeout 120s;
+    }
+
+    location /rest/v1/ {
+        limit_req zone=kairos_api burst=40 nodelay;
+        proxy_pass http://kairos_api_backend;
+        include /etc/nginx/snippets/proxy-params.conf;
+    }
+
+    location /storage/v1/ {
+        limit_req zone=kairos_upload burst=20 nodelay;
+        proxy_pass http://kairos_api_backend;
+        include /etc/nginx/snippets/proxy-params.conf;
+        proxy_request_buffering off;
+        proxy_read_timeout 300s;
+    }
+
+    location /realtime/v1 {
+        proxy_pass http://kairos_api_backend;
+        include /etc/nginx/snippets/proxy-params.conf;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering    off;
+        proxy_read_timeout 3600s;
+    }
+
+    location / {
+        limit_req zone=kairos_general burst=60 nodelay;
+        proxy_pass http://kairos_dashboard;
+        include /etc/nginx/snippets/proxy-params.conf;
+    }
+}
